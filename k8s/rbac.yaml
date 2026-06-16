@@ -10,20 +10,34 @@ metadata:
   name: aks-diagnose-readonly
 rules:
   - apiGroups: [""]
-    resources: ["pods", "nodes", "events", "persistentvolumeclaims",
-                "namespaces", "services", "endpoints"]
+    resources:
+      - pods
+      - nodes
+      - events
+      - persistentvolumeclaims
+      - namespaces
+      - services
+      - endpoints
     verbs: ["get", "list"]
   - apiGroups: ["apps"]
-    resources: ["deployments", "replicasets", "statefulsets", "daemonsets"]
+    resources:
+      - deployments
+      - replicasets
+      - statefulsets
+      - daemonsets
     verbs: ["get", "list"]
   - apiGroups: ["autoscaling"]
-    resources: ["horizontalpodautoscalers"]
+    resources:
+      - horizontalpodautoscalers
     verbs: ["get", "list"]
   - apiGroups: ["policy"]
-    resources: ["poddisruptionbudgets"]
+    resources:
+      - poddisruptionbudgets
     verbs: ["get", "list"]
   - apiGroups: ["batch"]
-    resources: ["jobs", "cronjobs"]
+    resources:
+      - jobs
+      - cronjobs
     verbs: ["get", "list"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1

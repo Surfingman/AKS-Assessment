@@ -1,53 +1,244 @@
 ﻿# run-diagnose.ps1
 # AKS 진단 도구 실행 스크립트
-# Pod YAML 로 이미지를 실행하고 kubectl cp 로 HTML 리포트를 로컬로 복사합니다.
-# Python/Docker 설치 불필요. kubectl 만 있으면 됩니다.
-#
-# 사용법:
-#   .\run-diagnose.ps1
-#   .\run-diagnose.ps1 -Namespace ml-pipeline
-#   .\run-diagnose.ps1 -Namespace ml-pipeline -Out C:\reports\report.html
-#   .\run-diagnose.ps1 -PrometheusUrl http://my-prometheus:9090
 
 param(
-    [string]$Namespace     = "",
+    [string]$Namespace = "",
     [string]$PrometheusUrl = "http://prom-prometheus-server.monitoring.svc.cluster.local:80",
-    [string]$Image         = "factorykr.azurecr.io/aks-diagnose:latest",
+    [string]$Image = "factorykr.azurecr.io/aks-diagnose:latest",
     [switch]$LocalImage,
-    [string]$Out           = ""
+    [switch]$UseAzureManagedPrometheus,
+    [string]$ManagedIdentityName = "aks-diagnose-mi",
+    [string]$AzureMonitorWorkspaceName = "",
+    [string]$Out = ""
 )
 
 if ($Out -eq "") {
-    $ts  = Get-Date -Format "yyyyMMdd_HHmm"
+    $ts = Get-Date -Format "yyyyMMdd_HHmm"
     $Out = "$PSScriptRoot\report_$ts.html"
 }
 
 $ErrorActionPreference = "Stop"
-$POD_NAME   = "aks-diagnose-$(Get-Date -Format 'HHmmss')"
+
 $SCRIPT_DIR = $PSScriptRoot
+$POD_NAMESPACE = "default"
+$SERVICE_ACCOUNT = "aks-diagnose"
+$POD_NAME = "aks-diagnose-$(Get-Date -Format 'HHmmss')"
+$PrometheusAad = $false
+
+function Require-Command($Name, $Hint) {
+    if (-not (Get-Command $Name -ErrorAction SilentlyContinue)) {
+        Write-Host "[FAIL] $Name not found. $Hint" -ForegroundColor Red
+        exit 1
+    }
+}
+
+function Get-CurrentAksFromKubectlContext {
+    $server = kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}'
+    if (-not $server) {
+        throw "kubectl context에서 cluster.server를 읽지 못했습니다."
+    }
+
+    $aksList = az aks list -o json | ConvertFrom-Json
+    $match = $aksList | Where-Object {
+        ($_.fqdn -and $server.Contains($_.fqdn)) -or
+        ($_.privateFqdn -and $server.Contains($_.privateFqdn))
+    } | Select-Object -First 1
+
+    if (-not $match) {
+        throw "현재 kubectl context와 일치하는 AKS를 찾지 못했습니다."
+    }
+
+    return $match
+}
+
+function Ensure-AzureManagedPrometheus {
+    Write-Host "[INFO] Azure Managed Prometheus 자동 설정..." -ForegroundColor Cyan
+
+    $aks = Get-CurrentAksFromKubectlContext
+    $ResourceGroup = $aks.resourceGroup
+    $AksName = $aks.name
+
+    Write-Host "[INFO] AKS detected: $ResourceGroup / $AksName" -ForegroundColor Cyan
+
+    $aksInfo = az aks show `
+        --resource-group $ResourceGroup `
+        --name $AksName `
+        -o json | ConvertFrom-Json
+
+    $issuer = $aksInfo.oidcIssuerProfile.issuerUrl
+    $wiEnabled = $false
+
+    if ($aksInfo.securityProfile -and $aksInfo.securityProfile.workloadIdentity) {
+        $wiEnabled = [bool]$aksInfo.securityProfile.workloadIdentity.enabled
+    }
+
+    if (-not $issuer -or -not $wiEnabled) {
+        Write-Host "[INFO] OIDC / Workload Identity 활성화 중..." -ForegroundColor Cyan
+
+        az aks update `
+            --resource-group $ResourceGroup `
+            --name $AksName `
+            --enable-oidc-issuer `
+            --enable-workload-identity | Out-Null
+
+        $aksInfo = az aks show `
+            --resource-group $ResourceGroup `
+            --name $AksName `
+            -o json | ConvertFrom-Json
+
+        $issuer = $aksInfo.oidcIssuerProfile.issuerUrl
+    }
+
+    if (-not $issuer) {
+        throw "OIDC issuer URL을 가져오지 못했습니다."
+    }
+
+    if ($AzureMonitorWorkspaceName -eq "") {
+        $workspaces = az monitor account list `
+            --resource-group $ResourceGroup `
+            -o json | ConvertFrom-Json
+
+        if (-not $workspaces -or $workspaces.Count -eq 0) {
+            throw "Azure Monitor Workspace를 찾지 못했습니다."
+        }
+
+        $workspace = $workspaces | Select-Object -First 1
+    } else {
+        $workspace = az monitor account show `
+            --resource-group $ResourceGroup `
+            --name $AzureMonitorWorkspaceName `
+            -o json | ConvertFrom-Json
+    }
+
+    $WorkspaceId = $workspace.id
+    $PromUrl = $workspace.metrics.prometheusQueryEndpoint
+
+    if (-not $PromUrl) {
+        throw "prometheusQueryEndpoint를 찾지 못했습니다."
+    }
+
+    Write-Host "[INFO] Azure Monitor Workspace: $($workspace.name)" -ForegroundColor Cyan
+    Write-Host "[INFO] Prometheus endpoint: $PromUrl" -ForegroundColor Cyan
+
+    $miJson = $null
+    $ErrorActionPreference = "Continue"
+    $miRaw = az identity show `
+        --resource-group $ResourceGroup `
+        --name $ManagedIdentityName `
+        -o json 2>$null
+    $miExit = $LASTEXITCODE
+    $ErrorActionPreference = "Stop"
+
+    if ($miExit -ne 0 -or -not $miRaw) {
+        Write-Host "[INFO] Managed Identity 생성: $ManagedIdentityName" -ForegroundColor Cyan
+
+        az identity create `
+            --resource-group $ResourceGroup `
+            --name $ManagedIdentityName | Out-Null
+    } else {
+        Write-Host "[OK]   Managed Identity exists: $ManagedIdentityName" -ForegroundColor Green
+    }
+
+    $miJson = az identity show `
+        --resource-group $ResourceGroup `
+        --name $ManagedIdentityName `
+        -o json | ConvertFrom-Json
+
+    $ClientId = $miJson.clientId
+    $PrincipalId = $miJson.principalId
+
+    Write-Host "[INFO] Managed Identity clientId: $ClientId" -ForegroundColor Cyan
+
+    $roleCount = az role assignment list `
+        --assignee-object-id $PrincipalId `
+        --scope $WorkspaceId `
+        --query "[?roleDefinitionName=='Monitoring Data Reader'] | length(@)" `
+        -o tsv
+
+    if ([int]$roleCount -eq 0) {
+        Write-Host "[INFO] Monitoring Data Reader 권한 부여..." -ForegroundColor Cyan
+
+        az role assignment create `
+            --assignee-object-id $PrincipalId `
+            --assignee-principal-type ServicePrincipal `
+            --role "Monitoring Data Reader" `
+            --scope $WorkspaceId | Out-Null
+    } else {
+        Write-Host "[OK]   Monitoring Data Reader already assigned" -ForegroundColor Green
+    }
+
+    $subject = "system:serviceaccount:${POD_NAMESPACE}:${SERVICE_ACCOUNT}"
+
+    $fedList = az identity federated-credential list `
+        --resource-group $ResourceGroup `
+        --identity-name $ManagedIdentityName `
+        -o json | ConvertFrom-Json
+
+    $fed = $fedList | Where-Object {
+        $_.issuer -eq $issuer -and $_.subject -eq $subject
+    } | Select-Object -First 1
+
+    if (-not $fed) {
+        Write-Host "[INFO] Federated Credential 생성..." -ForegroundColor Cyan
+
+        az identity federated-credential create `
+            --resource-group $ResourceGroup `
+            --identity-name $ManagedIdentityName `
+            --name "aks-diagnose-fed" `
+            --issuer $issuer `
+            --subject $subject | Out-Null
+    } else {
+        Write-Host "[OK]   Federated Credential already exists" -ForegroundColor Green
+    }
+
+    Write-Host "[INFO] ServiceAccount annotation 업데이트..." -ForegroundColor Cyan
+
+    kubectl annotate sa $SERVICE_ACCOUNT -n $POD_NAMESPACE `
+        azure.workload.identity/client-id="$ClientId" `
+        --overwrite | Out-Null
+
+    return @{
+        PrometheusUrl = $PromUrl
+        ClientId = $ClientId
+    }
+}
 
 Write-Host ""
 Write-Host "============================================" -ForegroundColor Cyan
-Write-Host "  AKS Diagnose Tool"                        -ForegroundColor Cyan
-Write-Host "  Image : $Image"                           -ForegroundColor Cyan
-Write-Host "  Output: $Out"                             -ForegroundColor Cyan
+Write-Host "  AKS Diagnose Tool" -ForegroundColor Cyan
+Write-Host "  Image : $Image" -ForegroundColor Cyan
+Write-Host "  Output: $Out" -ForegroundColor Cyan
 Write-Host "============================================" -ForegroundColor Cyan
 
-# 1. kubectl 확인
-if (-not (Get-Command kubectl -ErrorAction SilentlyContinue)) {
-    Write-Host "[FAIL] kubectl not found." -ForegroundColor Red
-    Write-Host "       Install: winget install Kubernetes.kubectl" -ForegroundColor Red
-    exit 1
+Require-Command "kubectl" "Install: winget install Kubernetes.kubectl"
+
+if ($UseAzureManagedPrometheus) {
+    Require-Command "az" "Install: winget install Microsoft.AzureCLI"
 }
+
 Write-Host "[INFO] Context: $(kubectl config current-context)" -ForegroundColor Cyan
 
-# 2. RBAC 적용 (최초 1회만 필요, 이후는 no-op)
 Write-Host "[INFO] Applying RBAC..." -ForegroundColor Cyan
 kubectl apply -f "$SCRIPT_DIR\k8s\rbac.yaml" | Out-Null
 Write-Host "[OK]   RBAC ready" -ForegroundColor Green
 
-# 3. 진단 인수 구성 (파일로 직접 저장)
-$pyArgs = @("--in-cluster", "--prometheus-url", $PrometheusUrl, "--out", "/tmp/report.html", "--no-history")
+if ($UseAzureManagedPrometheus) {
+    $managed = Ensure-AzureManagedPrometheus
+    $PrometheusUrl = $managed.PrometheusUrl
+    $PrometheusAad = $true
+}
+
+$pyArgs = @(
+    "--in-cluster",
+    "--prometheus-url", $PrometheusUrl,
+    "--out", "/tmp/report.html",
+    "--no-history"
+)
+
+if ($PrometheusAad) {
+    $pyArgs += "--prometheus-aad"
+}
+
 if ($Namespace -ne "") {
     $pyArgs = @("-n", $Namespace) + $pyArgs
     Write-Host "[INFO] Target: namespace=$Namespace" -ForegroundColor Cyan
@@ -56,28 +247,26 @@ if ($Namespace -ne "") {
     Write-Host "[INFO] Target: all namespaces (-A)" -ForegroundColor Cyan
 }
 
-# 4. Pod YAML 생성 후 실행
-# 전략: 진단 완료 후 300초(5분) sleep → Running 상태 유지 → kubectl cp 수행 → pod 삭제
-# (Completed/Terminated pod 에는 kubectl cp 불가)
-Write-Host "[INFO] Running pod: $POD_NAME ..." -ForegroundColor Cyan
-Write-Host "[INFO] 진단 중입니다. 1~2분 소요됩니다..." -ForegroundColor Gray
+Write-Host "[INFO] PrometheusUrl: $PrometheusUrl" -ForegroundColor Cyan
+Write-Host "[INFO] PrometheusAad: $PrometheusAad" -ForegroundColor Cyan
 
-# sh -c 로 한 줄 명령어로 실행
-# '||' 로 실패 신호도 캡처. ';sleep 120' 으로 성공/실패 무관하게 pod 를 120초 유지 → kubectl cp 가능
 $fullCmd = "python aks_diagnose.py $(($pyArgs | ForEach-Object { $_ }) -join ' ') && echo __DIAG_DONE__ || echo __DIAG_FAILED__; sleep 120"
-
-# 로컬 이미지 사용 시 imagePullPolicy: Never (ACR pull 불필요)
 $pullPolicy = if ($LocalImage) { "Never" } else { "Always" }
 
-# YAML을 직접 WriteAllText로 생성 (here-string 파싱 문제 회피)
 $yaml = @()
 $yaml += "apiVersion: v1"
 $yaml += "kind: Pod"
 $yaml += "metadata:"
 $yaml += "  name: $POD_NAME"
-$yaml += "  namespace: default"
+$yaml += "  namespace: $POD_NAMESPACE"
+
+if ($UseAzureManagedPrometheus) {
+    $yaml += "  labels:"
+    $yaml += "    azure.workload.identity/use: `"true`""
+}
+
 $yaml += "spec:"
-$yaml += "  serviceAccountName: aks-diagnose"
+$yaml += "  serviceAccountName: $SERVICE_ACCOUNT"
 $yaml += "  restartPolicy: Never"
 $yaml += "  containers:"
 $yaml += "  - name: aks-diagnose"
@@ -104,100 +293,92 @@ $yaml += "    emptyDir: {}"
 $tmpYaml = "$env:TEMP\aks-diag-$POD_NAME.yaml"
 ($yaml -join "`n") | Out-File -FilePath $tmpYaml -Encoding ascii -NoNewline
 
-# YAML 내용 확인 (디버그용 - 문제시 주석 해제)
-# Get-Content $tmpYaml
-
+Write-Host "[INFO] Running pod: $POD_NAME ..." -ForegroundColor Cyan
 kubectl apply -f $tmpYaml | Out-Null
 Remove-Item $tmpYaml -ErrorAction SilentlyContinue
 Write-Host "[OK]   Pod created" -ForegroundColor Green
 
-# 5. 진단 완료/실패 신호 대기 (pod 는 sleep 120 으로 Running 상태 유지)
 Write-Host "[INFO] 진단 완료 대기 중..." -ForegroundColor Cyan
-$timeout = 240; $elapsed = 0; $done = $false
+
+$timeout = 240
+$elapsed = 0
+$done = $false
+
 while ($elapsed -lt $timeout) {
-    # kubectl stderr 가 $ErrorActionPreference=Stop 에 걸리지 않도록 Continue 로 임시 전환
     $ErrorActionPreference = "Continue"
-    $phase = (kubectl get pod $POD_NAME -o jsonpath='{.status.phase}' 2>$null)
+    $phase = kubectl get pod $POD_NAME -n $POD_NAMESPACE -o jsonpath='{.status.phase}' 2>$null
     $ErrorActionPreference = "Stop"
 
     if ($phase -eq "Failed") {
         Write-Host "[FAIL] Pod 실패!" -ForegroundColor Red
-        Write-Host ""
-        Write-Host "=== kubectl describe pod $POD_NAME ===" -ForegroundColor Yellow
-        $ErrorActionPreference = "Continue"
-        kubectl describe pod $POD_NAME 2>&1
-        Write-Host ""
-        Write-Host "=== kubectl logs $POD_NAME ===" -ForegroundColor Yellow
-        kubectl logs $POD_NAME 2>&1
-        $ErrorActionPreference = "Stop"
-        Write-Host ""
-        kubectl delete pod $POD_NAME --ignore-not-found | Out-Null
+        kubectl describe pod $POD_NAME -n $POD_NAMESPACE
+        kubectl logs $POD_NAME -n $POD_NAMESPACE
+        kubectl delete pod $POD_NAME -n $POD_NAMESPACE --ignore-not-found | Out-Null
         exit 1
     }
 
-    # ContainerCreating / Pending 등 아직 시작 전이면 로그 조회 건너뜀
     if ($phase -ne "Running") {
-        Start-Sleep -Seconds 5; $elapsed += 5
+        Start-Sleep -Seconds 5
+        $elapsed += 5
         Write-Host "  Pod 시작 대기 중... ($elapsed / $timeout 초) [phase: $phase]" -ForegroundColor Gray
         continue
     }
 
-    # Running 상태일 때만 로그 확인
     $ErrorActionPreference = "Continue"
-    $logs = (kubectl logs $POD_NAME 2>$null)
+    $logs = kubectl logs $POD_NAME -n $POD_NAMESPACE 2>$null
     $ErrorActionPreference = "Stop"
 
-    if ($logs -match '__DIAG_FAILED__') {
+    if ($logs -match "__DIAG_FAILED__") {
         Write-Host "[FAIL] 진단 스크립트 오류. Pod 로그:" -ForegroundColor Red
         Write-Host $logs -ForegroundColor Yellow
-        Write-Host ""
-        Write-Host "[INFO] 디버그 명령어 (pod 가 곧 삭제됩니다):" -ForegroundColor Cyan
-        Write-Host "       kubectl logs $POD_NAME" -ForegroundColor Gray
-        Write-Host "       kubectl exec -it $POD_NAME -- sh" -ForegroundColor Gray
-        kubectl delete pod $POD_NAME --ignore-not-found | Out-Null
+        Write-Host "kubectl exec -it $POD_NAME -n $POD_NAMESPACE -- sh" -ForegroundColor Gray
+        kubectl delete pod $POD_NAME -n $POD_NAMESPACE --ignore-not-found | Out-Null
         exit 1
     }
-    if ($logs -match '__DIAG_DONE__') { $done = $true; break }
 
-    Start-Sleep -Seconds 5; $elapsed += 5
+    if ($logs -match "__DIAG_DONE__") {
+        $done = $true
+        break
+    }
+
+    Start-Sleep -Seconds 5
+    $elapsed += 5
     Write-Host "  대기 중... ($elapsed / $timeout 초) [phase: $phase]" -ForegroundColor Gray
 }
 
 if (-not $done) {
     Write-Host "[FAIL] 타임아웃 ($timeout 초). Pod 로그:" -ForegroundColor Red
-    kubectl logs $POD_NAME 2>&1
-    Write-Host ""
-    Write-Host "[INFO] 디버그 명령어:" -ForegroundColor Cyan
-    Write-Host "       kubectl logs $POD_NAME" -ForegroundColor Gray
-    Write-Host "       kubectl describe pod $POD_NAME" -ForegroundColor Gray
-    kubectl delete pod $POD_NAME --ignore-not-found | Out-Null
+    kubectl logs $POD_NAME -n $POD_NAMESPACE
+    kubectl delete pod $POD_NAME -n $POD_NAMESPACE --ignore-not-found | Out-Null
     exit 1
 }
+
 Write-Host "[OK]   진단 완료" -ForegroundColor Green
 
-# 6. kubectl cp 로 HTML 파일을 로컬로 복사 (UTF-8 바이너리 그대로 전송 → 한글 깨짐 없음)
-# ※ kubectl cp 는 Windows 절대경로(C:\...)의 콜론을 remote 경로로 오인함
-#   → 스크립트 디렉토리에서 파일명(콜론 없음)으로 복사 후 $Out 으로 이동
 Write-Host "[INFO] 리포트 추출 중 (kubectl cp)..." -ForegroundColor Cyan
+
 $tmpName = "aks-tmp-$POD_NAME.html"
 $tmpFull = Join-Path $PSScriptRoot $tmpName
+
 Push-Location $PSScriptRoot
 $ErrorActionPreference = "Continue"
-$cpOutput = kubectl cp "default/${POD_NAME}:/tmp/report.html" $tmpName 2>&1
+$cpOutput = kubectl cp "${POD_NAMESPACE}/${POD_NAME}:/tmp/report.html" $tmpName 2>&1
 $cpExit = $LASTEXITCODE
 $ErrorActionPreference = "Stop"
 Pop-Location
+
 if ($cpExit -ne 0 -or -not (Test-Path $tmpFull)) {
     Write-Host "[FAIL] kubectl cp 실패 (exit=$cpExit): $cpOutput" -ForegroundColor Red
     Remove-Item $tmpFull -ErrorAction SilentlyContinue
-    kubectl delete pod $POD_NAME --ignore-not-found | Out-Null
+    kubectl delete pod $POD_NAME -n $POD_NAMESPACE --ignore-not-found | Out-Null
     exit 1
 }
-Move-Item $tmpFull $Out -Force
-Write-Host "[OK]   Pod 정리 중..." -ForegroundColor Green
-kubectl delete pod $POD_NAME --ignore-not-found | Out-Null
 
-# 7. 결과 열기
+Move-Item $tmpFull $Out -Force
+
+Write-Host "[OK]   Pod 정리 중..." -ForegroundColor Green
+kubectl delete pod $POD_NAME -n $POD_NAMESPACE --ignore-not-found | Out-Null
+
 if (Test-Path $Out) {
     $size = [math]::Round((Get-Item $Out).Length / 1KB, 1)
     Write-Host ""

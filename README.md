@@ -167,6 +167,48 @@ Prometheus 가 클러스터 내에 설치되어 있으면 CPU throttle · 메모
 > ./run-diagnose.sh -p http://prometheus.monitoring.svc.cluster.local:9090
 > ```
 
+---
+
+#### (선택) Azure Managed Prometheus 자동 연결 — `-UseAzureManagedPrometheus`
+
+AKS 생성 시 **Azure Monitor 관리형 Prometheus** 를 활성화한 환경이라면
+`-UseAzureManagedPrometheus` 스위치 하나만으로 Prometheus 주소를 자동으로 감지·연결합니다.
+별도로 URL 을 찾거나 입력할 필요가 없습니다.
+
+```powershell
+# Windows — Azure Managed Prometheus 자동 연결
+.\run-diagnose.ps1 -UseAzureManagedPrometheus
+
+# 특정 네임스페이스 + Azure Managed Prometheus
+.\run-diagnose.ps1 -UseAzureManagedPrometheus -Namespace ml-pipeline
+```
+
+> 이 옵션을 사용하려면 `az` (Azure CLI) 가 설치되어 있고 `az login` 이 완료된 상태여야 합니다.
+> ```powershell
+> winget install Microsoft.AzureCLI   # az 설치
+> az login                             # Azure 로그인
+> ```
+
+**자동으로 수행되는 작업 (최초 1회):**
+
+| 단계 | 내용 |
+|------|------|
+| 1. AKS 감지 | 현재 `kubectl context` 에서 AKS 클러스터 자동 식별 |
+| 2. OIDC / Workload Identity | 미활성 시 자동 활성화 (`az aks update`) |
+| 3. Azure Monitor Workspace | 리소스 그룹 내 Workspace 자동 탐색, Prometheus 엔드포인트 추출 |
+| 4. Managed Identity 생성 | `aks-diagnose-mi` 이름으로 생성 (이미 존재하면 재사용) |
+| 5. 역할 부여 | Managed Identity 에 `Monitoring Data Reader` 권한 자동 부여 |
+| 6. Federated Credential | K8s ServiceAccount(`aks-diagnose`) ↔ Managed Identity 연결 |
+| 7. SA annotation | `azure.workload.identity/client-id` 자동 설정 |
+
+> **Azure Monitor Workspace 가 여러 개인 경우** `-AzureMonitorWorkspaceName` 옵션으로 지정하세요.
+> ```powershell
+> .\run-diagnose.ps1 -UseAzureManagedPrometheus -AzureMonitorWorkspaceName my-amw
+> ```
+
+> **이 옵션 없이도** 클러스터 내부에 직접 설치된 Prometheus(Helm 등)가 있으면 기본 URL 또는
+> `-PrometheusUrl` 로 연결할 수 있습니다.
+
 
 실행 흐름:
 ```

@@ -1,0 +1,52 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: aks-diagnose-debug
+  namespace: default
+spec:
+  serviceAccountName: aks-diagnose
+  restartPolicy: Never
+
+  containers:
+    - name: aks-diagnose
+      image: factorykr.azurecr.io/aks-diagnose:latest
+      imagePullPolicy: Always
+
+      command:
+        - sh
+        - -c
+        - |
+          echo "===== DEBUG ====="
+          pwd
+          ls -al
+          echo "===== aks_diagnose.py ====="
+          find / -name aks_diagnose.py 2>/dev/null
+          echo "===== RUN ====="
+
+          python aks_diagnose.py \
+            -A \
+            --in-cluster \
+            --prometheus-url http://prom-prometheus-server.monitoring.svc.cluster.local:80 \
+            --out /tmp/report.html \
+            --no-history
+
+          echo "__DIAG_DONE__"
+
+          # 디버깅을 위해 Pod 유지
+          sleep 3600
+
+      resources:
+        requests:
+          cpu: 100m
+          memory: 128Mi
+        limits:
+          cpu: "1"
+          memory: 512Mi
+
+      volumeMounts:
+        - name: tmp-vol
+          mountPath: /tmp
+
+  volumes:
+    - name: tmp-vol
+      emptyDir: {}

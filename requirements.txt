@@ -1,0 +1,6 @@
+# aks_diagnose v2 의존성 (--demo 는 의존성 없이 동작)
+kubernetes>=29.0           # 계층 K: Kubernetes API (get/list)
+requests>=2.31             # 계층 P: Prometheus PromQL HTTP API
+azure-identity>=1.15       # AAD (Workload Identity / DefaultAzureCredential)
+azure-monitor-query>=1.2   # 계층 T: App Insights/Log Analytics KQL (트레이싱)
+azure-storage-blob>=12.19  # 운영: 리포트·이력 Blob 적재

@@ -1,0 +1,61 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: aks-diagnose
+  namespace: ml-pipeline
+spec:
+  schedule: "0 * * * *"            # 매시 정각 (원하는 주기로 조정)
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 600
+      template:
+        metadata:
+          labels:
+            azure.workload.identity/use: "true"    # Workload Identity 활성
+        spec:
+          serviceAccountName: aks-diagnose
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            seccompProfile: { type: RuntimeDefault }
+          containers:
+          - name: aks-diagnose
+            image: <ACR>.azurecr.io/aks-diagnose:latest
+            args:
+            - "--in-cluster"
+            - "-n"
+            - "ml-pipeline"
+            - "--component-label"
+            - "component"
+            - "--prometheus-url"
+            - "$(PROM_URL)"
+            - "--prometheus-aad"
+            - "--appinsights-id"
+            - "$(APPINSIGHTS_ID)"
+            - "--trace-table-mode"
+            - "classic"
+            - "--blob-account-url"
+            - "$(BLOB_URL)"
+            - "--blob-container"
+            - "aks-diagnose"
+            - "--out"
+            - "/tmp/report.html"
+            env:
+            - { name: PROM_URL,       value: "https://<amw>.<region>.prometheus.monitor.azure.com" }
+            - { name: APPINSIGHTS_ID, value: "/subscriptions/<sub>/resourceGroups/<rg>/providers/microsoft.insights/components/<ai>" }
+            - { name: BLOB_URL,       value: "https://<storageacct>.blob.core.windows.net" }
+            resources:
+              requests: { cpu: "100m", memory: "128Mi" }
+              limits:   { cpu: "500m", memory: "256Mi" }
+            securityContext:
+              allowPrivilegeEscalation: false
+              readOnlyRootFilesystem: true
+              capabilities: { drop: ["ALL"] }
+            volumeMounts:
+            - { name: tmp, mountPath: /tmp }     # readOnlyRootFilesystem 이라 /tmp 는 별도 볼륨
+          volumes:
+          - { name: tmp, emptyDir: {} }

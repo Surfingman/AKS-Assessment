@@ -169,10 +169,10 @@ Prometheus 가 클러스터 내에 설치되어 있으면 CPU throttle · 메모
 
 ---
 
-#### (선택) Azure Managed Prometheus 자동 연결 — `-UseAzureManagedPrometheus`
+#### (선택) Azure Managed Prometheus 자동 연결 — `-UseAzureManagedPrometheus` / `--use-azure-managed-prometheus`
 
 AKS 생성 시 **Azure Monitor 관리형 Prometheus** 를 활성화한 환경이라면
-`-UseAzureManagedPrometheus` 스위치 하나만으로 Prometheus 주소를 자동으로 감지·연결합니다.
+이 옵션 하나만으로 Prometheus 주소를 자동으로 감지·연결합니다.
 별도로 URL 을 찾거나 입력할 필요가 없습니다.
 
 ```powershell
@@ -183,10 +183,25 @@ AKS 생성 시 **Azure Monitor 관리형 Prometheus** 를 활성화한 환경이
 .\run-diagnose.ps1 -UseAzureManagedPrometheus -Namespace ml-pipeline
 ```
 
+```bash
+# Linux / macOS — Azure Managed Prometheus 자동 연결
+./run-diagnose.sh --use-azure-managed-prometheus
+
+# 특정 네임스페이스 + Azure Managed Prometheus
+./run-diagnose.sh --use-azure-managed-prometheus -n ml-pipeline
+```
+
 > 이 옵션을 사용하려면 `az` (Azure CLI) 가 설치되어 있고 `az login` 이 완료된 상태여야 합니다.
+> Linux / macOS 에서는 JSON 파싱을 위해 `python3` 도 필요합니다.
 > ```powershell
+> # Windows
 > winget install Microsoft.AzureCLI   # az 설치
 > az login                             # Azure 로그인
+> ```
+> ```bash
+> # Linux / macOS — 예: Ubuntu
+> curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash   # az 설치
+> az login                                                  # Azure 로그인
 > ```
 
 **자동으로 수행되는 작업 (최초 1회):**
@@ -201,9 +216,12 @@ AKS 생성 시 **Azure Monitor 관리형 Prometheus** 를 활성화한 환경이
 | 6. Federated Credential | K8s ServiceAccount(`aks-diagnose`) ↔ Managed Identity 연결 |
 | 7. SA annotation | `azure.workload.identity/client-id` 자동 설정 |
 
-> **Azure Monitor Workspace 가 여러 개인 경우** `-AzureMonitorWorkspaceName` 옵션으로 지정하세요.
+> **Azure Monitor Workspace 가 여러 개인 경우** `-AzureMonitorWorkspaceName` (bash: `--azure-monitor-workspace-name`) 옵션으로 지정하세요.
 > ```powershell
 > .\run-diagnose.ps1 -UseAzureManagedPrometheus -AzureMonitorWorkspaceName my-amw
+> ```
+> ```bash
+> ./run-diagnose.sh --use-azure-managed-prometheus --azure-monitor-workspace-name my-amw
 > ```
 
 > **이 옵션 없이도** 클러스터 내부에 직접 설치된 Prometheus(Helm 등)가 있으면 기본 URL 또는
